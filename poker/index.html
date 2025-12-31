@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/svg+xml" href="/vite.svg" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>MonadPoker.xyz - On-chain Texas Hold'em</title>
+    <style>
+      /* Hide Multisynq/Croquet loading spinner - must be in HTML to load before JS */
+      #multisynq_spinnerOverlay,
+      #croquet_spinnerOverlay,
+      #croquet_overlay,
+      .croquet_spinnerOverlay,
+      .croquet_overlay,
+      .croquet_fatal,
+      .multisynq_fatal,
+      .multisynq_error,
+      [id*="croquet"],
+      [id*="multisynq"],
+      [class*="croquet"],
+      [class*="multisynq"] {
+        display: none !important;
+        opacity: 0 !important;
+        visibility: hidden !important;
+        pointer-events: none !important;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="root"></div>
+    <!-- Early polyfills for Node globals expected by some libraries (e.g., viem) -->
+    <script type="module">
+      import { Buffer } from 'buffer';
+      if (!window.Buffer) window.Buffer = Buffer;
+      if (!window.global) window.global = window;
+    </script>
+    <script type="module" src="/src/index.tsx"></script>
+  </body>
+</html>
