@@ -25,7 +25,7 @@ import './index.css';
 import { createRoot } from 'react-dom/client';
 import { PrivyProvider } from '@privy-io/react-auth';
 import { App } from "./App";
-import { monadTestnet } from './entropyDealer';
+import { monadTestnet } from './entropyDealerV2';
 
 // Privy App ID should be set in poker/.env as VITE_PRIVY_APP_ID
 const privyAppId = ((import.meta as any).env?.VITE_PRIVY_APP_ID || '') as string;

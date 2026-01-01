@@ -7,7 +7,7 @@ import {
   parseEther,
   type Address 
 } from 'viem';
-import { monadTestnet, getPublicClient } from '../entropyDealer';
+import { monadTestnet, getPublicClient } from '../entropyDealerV2';
 
 interface WalletInfoState {
   embeddedBalance: string;

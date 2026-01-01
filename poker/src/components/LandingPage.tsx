@@ -6,7 +6,7 @@ import { JoinTableModal } from './modals/JoinTableModal';
 import { Toaster, toast } from 'sonner';
 import { Copy, LogOut, Plus, Users, Key, Send, Check, Wallet, ChevronLeft } from 'lucide-react';
 import { formatEther, parseEther, createWalletClient, custom, type Address } from 'viem';
-import { getPublicClient, monadTestnet } from '../entropyDealer';
+import { getPublicClient, monadTestnet } from '../entropyDealerV2';
 import { Button, Input, Label, Card } from './ui/Shared';
 import { ConnectionStatus } from './ConnectionStatus';
 

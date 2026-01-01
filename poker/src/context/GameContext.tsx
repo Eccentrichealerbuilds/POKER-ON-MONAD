@@ -4,7 +4,7 @@ import { Player } from '../types';
 import { GameState, PlayerAction, GameStage } from '../types';
 import { useStateTogether } from 'react-together';
 import { usePrivy, useWallets, type ConnectedWallet } from '@privy-io/react-auth';
-import { keccak256, createWalletClient, custom, type Hex, type Address } from 'viem';
+import { createWalletClient, custom, type Hex, type Address } from 'viem';
 
 type GameSettings = {
   startingChips: number;
@@ -42,18 +42,21 @@ type GameContextType = {
   turnDeadline: number | null;
 };
 
-// Helper imports for embedded wallet contract interaction
+// V2 Commit-Reveal VRF imports
 import { 
   fetchShuffleFee, 
+  encodeCommitSaltData,
   encodeRequestShuffleData, 
   DEALER_ADDRESS, 
-  waitForDeck,
+  waitForVRFFulfilled,
   parseSequenceFromReceipt,
   getPublicClient,
   monadTestnet,
-} from '../entropyDealer';
+  generateGameId,
+} from '../entropyDealerV2';
 
-type ShuffleResponse = { packedDeck: string; txHash?: string; sequence: bigint; deckHash: Hex };
+// Card Dealer API (V2 - commit-reveal, deck stays off-chain)
+import * as cardDealerApi from '../cardDealerApi';
 
 // Normalize transaction errors to user-friendly codes/messages
 function normalizeTxError(err: any): { code: 'INSUFFICIENT_FUNDS' | 'USER_REJECTED' | 'TX_ERROR'; message: string } {
@@ -86,124 +89,129 @@ function normalizeTxError(err: any): { code: 'INSUFFICIENT_FUNDS' | 'USER_REJECT
   return { code: 'TX_ERROR', message: 'Transaction failed. Please try again.' };
 }
 
-// Send shuffle using the Privy embedded wallet (in-app)
-const requestShuffleWithEmbeddedWallet = async (embeddedWallet: ConnectedWallet) => {
+// V2 Shuffle Response type
+type ShuffleResponseV2 = { 
+  gameId: Hex; 
+  txHash?: string; 
+  sequence: bigint; 
+};
+
+// V2: Commit-reveal shuffle using backend for card dealing
+const requestShuffleV2 = async (
+  embeddedWallet: ConnectedWallet,
+  roomCode: string,
+  handCounter: number
+): Promise<ShuffleResponseV2> => {
   if (!embeddedWallet?.address) {
     throw new Error('Embedded wallet not found');
   }
   const embeddedAddress = embeddedWallet.address as Address;
-  console.log('[Shuffle] Using Embedded wallet address:', embeddedAddress);
+  console.log('[V2 Shuffle] Using Embedded wallet address:', embeddedAddress);
 
-  // Get shuffle fee from contract
-  const fee = await fetchShuffleFee();
-  
-  // Encode the contract call data
-  const data = encodeRequestShuffleData();
+  // Generate unique gameId for this hand
+  const gameId = generateGameId(roomCode, handCounter);
+  console.log('[V2 Shuffle] Generated gameId:', gameId);
 
-  // Pre-check balance vs. required cost to provide instant feedback
-  // Also capture gas & gasPrice to pass explicitly to wallet to avoid undefined conversions
-  let gasEstimate: bigint | undefined;
-  let gasPrice: bigint | undefined;
-  try {
-    const publicClient = getPublicClient();
-    const gas = await publicClient.estimateGas({
-      account: embeddedAddress as any,
-      to: DEALER_ADDRESS,
-      data,
-      value: fee,
-    });
-    gasEstimate = gas;
-    gasPrice = await publicClient.getGasPrice();
-    const needed = gas * (gasPrice as bigint) + fee;
-    const balance = await publicClient.getBalance({ address: embeddedAddress as any });
-    if (balance < needed) {
-      console.warn('[PreCheck] Insufficient funds. balance=', balance.toString(), 'needed=', needed.toString());
-      const e: any = new Error('Insufficient balance to cover shuffle fee and gas. Please fund your wallet and retry.');
-      e.code = 'INSUFFICIENT_FUNDS';
-      throw e;
-    }
-  } catch (preErr) {
-    console.warn('[PreCheck] Error during gas/balance pre-check:', preErr);
-    // Normalize for side effects/logging; ignore result here
-    normalizeTxError(preErr);
-  }
+  // Step 1: Initialize game on backend - get saltHash
+  console.log('[V2 Shuffle] Step 1: Initializing game on backend...');
+  const { saltHash } = await cardDealerApi.initializeGame(gameId);
+  console.log('[V2 Shuffle] Got saltHash from backend:', saltHash);
 
-  console.log('Sending shuffle transaction with:', { to: DEALER_ADDRESS, data, value: fee, gas: gasEstimate, gasPrice });
-
-  // Build a viem wallet client from the embedded wallet provider
+  // Build wallet client
   const provider = await embeddedWallet.getEthereumProvider();
   const walletClient = createWalletClient({ chain: monadTestnet, transport: custom(provider) });
+  const publicClient = getPublicClient();
 
-  // Send tx (viem handles bigint serialization)
-  const txHash = await walletClient.sendTransaction({
+  // Step 2: Commit saltHash on-chain
+  console.log('[V2 Shuffle] Step 2: Committing saltHash on-chain...');
+  const commitData = encodeCommitSaltData(gameId, saltHash as Hex);
+  const commitTxHash = await walletClient.sendTransaction({
     account: embeddedAddress,
     to: DEALER_ADDRESS,
-    data,
-    value: fee,
-    // Let node estimate gas/price; we only used estimates for pre-check
+    data: commitData,
   });
-  if (!txHash) {
-    throw new Error('No transaction hash returned from wallet');
-  }
-
-  // Wait for transaction receipt and parse sequence number
-  const publicClient = getPublicClient();
-  // Manually poll for receipt to avoid BigInt formatting issues inside viem wait helper
-  let receipt: any | null = null;
+  
+  // Wait for commit tx
+  let commitReceipt: any = null;
   for (let i = 0; i < 40; i++) {
     try {
-      receipt = await publicClient.getTransactionReceipt({ hash: txHash as `0x${string}` });
+      commitReceipt = await publicClient.getTransactionReceipt({ hash: commitTxHash as `0x${string}` });
       break;
     } catch (_e) {
-      // Receipt not ready yet
       await new Promise((r) => setTimeout(r, 1500));
     }
   }
-  if (!receipt) {
-    throw new Error('Transaction receipt not found within timeout');
+  if (!commitReceipt || commitReceipt.status !== 'success') {
+    throw new Error('Salt commit transaction failed');
   }
-  if ((receipt as any)?.status && (receipt as any).status !== 'success') {
-    throw new Error('Transaction failed or was reverted');
-  }
-  const sequenceNumber = parseSequenceFromReceipt(receipt);
+  console.log('[V2 Shuffle] Salt committed successfully');
+
+  // Step 3: Request shuffle on-chain (requires fee)
+  console.log('[V2 Shuffle] Step 3: Requesting shuffle...');
+  const fee = await fetchShuffleFee();
+  const shuffleData = encodeRequestShuffleData(gameId);
   
-  if (!sequenceNumber) {
-    throw new Error('Failed to parse sequence number from transaction receipt');
-  }
-
-  // Wait for the shuffle to complete and get the packed deck
-  try {
-    return new Promise<ShuffleResponse>(async (resolve, reject) => {
-      let unwatch: (() => void) | undefined;
-      const timeout = setTimeout(() => {
-        try { unwatch && unwatch(); } catch {}
-        reject(new Error('Shuffle timeout - deck not received within 30 seconds'));
-      }, 30000);
-
-      console.log('Waiting for shuffle event with sequence:', sequenceNumber.toString());
-      
-      try {
-        unwatch = await waitForDeck(sequenceNumber, (packedDeck: string) => {
-          console.log('Received shuffled deck:', packedDeck);
-          console.log('Deck type:', typeof packedDeck, 'length:', packedDeck.length);
-          clearTimeout(timeout);
-          try { unwatch && unwatch(); } catch {}
-          // Compute deck hash (bytes32)
-          const deckHash = keccak256(packedDeck as Hex);
-          resolve({ packedDeck, txHash, sequence: sequenceNumber, deckHash });
-        });
-      } catch (watchErr) {
-        clearTimeout(timeout);
-        reject(watchErr);
-      }
-    });
-  } catch (error) {
-    console.error('Shuffle request failed:', error);
-    const norm = normalizeTxError(error);
-    const e: any = new Error(norm.message);
-    e.code = norm.code;
+  // Pre-check balance
+  const balance = await publicClient.getBalance({ address: embeddedAddress as any });
+  const gasEstimate = await publicClient.estimateGas({
+    account: embeddedAddress as any,
+    to: DEALER_ADDRESS,
+    data: shuffleData,
+    value: fee,
+  });
+  const gasPrice = await publicClient.getGasPrice();
+  const needed = gasEstimate * gasPrice + fee;
+  if (balance < needed) {
+    const e: any = new Error('Insufficient balance to cover shuffle fee and gas. Please fund your wallet and retry.');
+    e.code = 'INSUFFICIENT_FUNDS';
     throw e;
   }
+
+  const shuffleTxHash = await walletClient.sendTransaction({
+    account: embeddedAddress,
+    to: DEALER_ADDRESS,
+    data: shuffleData,
+    value: fee,
+  });
+
+  // Wait for shuffle tx
+  let shuffleReceipt: any = null;
+  for (let i = 0; i < 40; i++) {
+    try {
+      shuffleReceipt = await publicClient.getTransactionReceipt({ hash: shuffleTxHash as `0x${string}` });
+      break;
+    } catch (_e) {
+      await new Promise((r) => setTimeout(r, 1500));
+    }
+  }
+  if (!shuffleReceipt || shuffleReceipt.status !== 'success') {
+    throw new Error('Shuffle request transaction failed');
+  }
+  const sequenceNumber = parseSequenceFromReceipt(shuffleReceipt);
+  console.log('[V2 Shuffle] Shuffle requested, sequence:', sequenceNumber.toString());
+
+  // Step 4: Wait for VRF callback
+  console.log('[V2 Shuffle] Step 4: Waiting for VRF callback...');
+  return new Promise<ShuffleResponseV2>((resolve, reject) => {
+    let unwatch: (() => void) | undefined;
+    const timeout = setTimeout(() => {
+      try { unwatch && unwatch(); } catch {}
+      reject(new Error('VRF timeout - callback not received within 60 seconds'));
+    }, 60000);
+
+    waitForVRFFulfilled(gameId, async (pythSeed: string) => {
+      console.log('[V2 Shuffle] VRF fulfilled, pythSeed:', pythSeed);
+      clearTimeout(timeout);
+      try { unwatch && unwatch(); } catch {}
+
+      // Step 5: Notify backend of pythSeed - backend computes deck
+      console.log('[V2 Shuffle] Step 5: Notifying backend of VRF result...');
+      await cardDealerApi.notifyVRFFulfilled(gameId, pythSeed);
+      console.log('[V2 Shuffle] Backend notified, deck ready for dealing');
+
+      resolve({ gameId, txHash: shuffleTxHash, sequence: sequenceNumber });
+    }).then(uw => { unwatch = uw; }).catch(reject);
+  });
 };
 
 // Shared state types for Multisynq
@@ -560,19 +568,38 @@ export const GameProvider: React.FC<{
       setIsDealing(true);
       const embeddedWallet = wallets?.find((w) => (w as any).walletClientType === 'privy') as ConnectedWallet | undefined;
       if (!embeddedWallet) throw new Error('No embedded wallet available. Please log in.');
-      const { packedDeck, txHash, sequence, deckHash } = await requestShuffleWithEmbeddedWallet(embeddedWallet);
-      console.log('Shuffle successful, starting game with deck:', packedDeck);
+      
+      // V2: Use commit-reveal shuffle with backend card dealing
+      const roomCode = window.location.pathname.split('/').pop() || 'default';
+      const { gameId, txHash, sequence } = await requestShuffleV2(embeddedWallet, roomCode, 1);
+      console.log('[V2] Shuffle successful, gameId:', gameId);
+      
+      // Deal cards from backend API for each player
+      for (const playerName of desiredPlayers) {
+        const { cards } = await cardDealerApi.dealCards(gameId, playerName, 2);
+        console.log(`[V2] Dealt cards to ${playerName}:`, cards);
+      }
+      
+      // Get all dealt cards to build packed deck for engine
+      const allCards: number[] = [];
+      for (const playerName of desiredPlayers) {
+        const { cards } = await cardDealerApi.getPlayerCards(gameId, playerName);
+        allCards.push(...cards);
+      }
+      // Pad to 52 cards for engine compatibility
+      while (allCards.length < 52) allCards.push(allCards.length % 52);
+      const packedDeck = cardDealerApi.cardsToPackedDeck(allCards);
+      
       newEngine.startNewHandWithPackedDeck(packedDeck);
       const gs = newEngine.getState();
-      console.log('Game state after starting hand:', gs);
+      console.log('[V2] Game state after starting hand:', gs);
       setGameState(gs);
-      setSharedGame({ gameState: gs, lastTxHash: txHash ?? null, showdownData: null, handSeq: sequence?.toString() ?? '0', deckHash, handCounter: 1 });
+      setSharedGame({ gameState: gs, lastTxHash: txHash ?? null, showdownData: null, handSeq: sequence?.toString() ?? '0', deckHash: gameId, handCounter: 1 });
       setLobby({ creatorId: clientId, started: true, settings: gameSettings });
       setGameStarted(true);
-      console.log('Game started successfully');
+      console.log('[V2] Game started successfully');
     } catch (err) {
       console.error('Failed to start game - shuffle error:', err);
-      // Don't start the game if shuffle fails
       setEngine(null);
       const code = (err as any)?.code ?? 'TX_ERROR';
       const message = (err as any)?.message || 'Failed to shuffle deck on-chain. Please try again.';
@@ -687,16 +714,34 @@ export const GameProvider: React.FC<{
   const nextHand = async () => {
     if (!engine || !isHost || !isLeader) return;
     engine.settlePot();
-    // After settling, request a new shuffled deck using embedded wallet
+    // After settling, request a new shuffled deck using V2 commit-reveal
     try {
       setIsDealing(true);
       const embeddedWallet = wallets?.find((w) => (w as any).walletClientType === 'privy') as ConnectedWallet | undefined;
       if (!embeddedWallet) throw new Error('No embedded wallet available. Please log in.');
-      const { packedDeck, txHash, sequence, deckHash } = await requestShuffleWithEmbeddedWallet(embeddedWallet);
+      
+      const roomCode = window.location.pathname.split('/').pop() || 'default';
+      const nextCount = (sharedGame as any)?.handCounter ? (sharedGame as any).handCounter + 1 : 1;
+      const { gameId, txHash, sequence } = await requestShuffleV2(embeddedWallet, roomCode, nextCount);
+      
+      // Deal cards from backend for each player
+      const playerNames = engine.getState().players.map(p => p.name);
+      for (const playerName of playerNames) {
+        await cardDealerApi.dealCards(gameId, playerName, 2);
+      }
+      
+      // Build packed deck for engine
+      const allCards: number[] = [];
+      for (const playerName of playerNames) {
+        const { cards } = await cardDealerApi.getPlayerCards(gameId, playerName);
+        allCards.push(...cards);
+      }
+      while (allCards.length < 52) allCards.push(allCards.length % 52);
+      const packedDeck = cardDealerApi.cardsToPackedDeck(allCards);
+      
       engine.startNewHandWithPackedDeck(packedDeck);
       const gs = engine.getState();
-      const nextCount = (sharedGame as any)?.handCounter ? (sharedGame as any).handCounter + 1 : 1;
-      setSharedGame({ gameState: gs, lastTxHash: txHash ?? null, showdownData: null, handSeq: sequence?.toString() ?? '0', deckHash, handCounter: nextCount });
+      setSharedGame({ gameState: gs, lastTxHash: txHash ?? null, showdownData: null, handSeq: sequence?.toString() ?? '0', deckHash: gameId, handCounter: nextCount });
     } catch (err) {
       console.error('Failed to shuffle for next hand:', err);
       const code = (err as any)?.code ?? 'TX_ERROR';
@@ -723,17 +768,32 @@ export const GameProvider: React.FC<{
       setIsDealing(true);
       const embeddedWallet = wallets?.find((w) => (w as any).walletClientType === 'privy') as ConnectedWallet | undefined;
       if (!embeddedWallet) throw new Error('No embedded wallet available. Please log in.');
-      const { packedDeck, txHash, sequence, deckHash } = await requestShuffleWithEmbeddedWallet(embeddedWallet);
+      
+      const roomCode = window.location.pathname.split('/').pop() || 'default';
+      const nextCount = (sharedGame as any)?.handCounter ? (sharedGame as any).handCounter + 1 : 1;
+      const { gameId, txHash, sequence } = await requestShuffleV2(embeddedWallet, roomCode, nextCount);
       
       if (engine) {
-        // If game is active, start new hand with shuffled deck
+        // Deal cards from backend for each player
+        const playerNames = engine.getState().players.map(p => p.name);
+        for (const playerName of playerNames) {
+          await cardDealerApi.dealCards(gameId, playerName, 2);
+        }
+        
+        // Build packed deck for engine
+        const allCards: number[] = [];
+        for (const playerName of playerNames) {
+          const { cards } = await cardDealerApi.getPlayerCards(gameId, playerName);
+          allCards.push(...cards);
+        }
+        while (allCards.length < 52) allCards.push(allCards.length % 52);
+        const packedDeck = cardDealerApi.cardsToPackedDeck(allCards);
+        
         engine.startNewHandWithPackedDeck(packedDeck);
         const gs = engine.getState();
-        const nextCount = (sharedGame as any)?.handCounter ? (sharedGame as any).handCounter + 1 : 1;
-        setSharedGame({ gameState: gs, lastTxHash: txHash ?? null, showdownData: null, handSeq: sequence?.toString() ?? '0', deckHash, handCounter: nextCount });
+        setSharedGame({ gameState: gs, lastTxHash: txHash ?? null, showdownData: null, handSeq: sequence?.toString() ?? '0', deckHash: gameId, handCounter: nextCount });
         alert('Manual reshuffle successful! New hand started.');
       } else {
-        // If no active game, just confirm shuffle worked
         setLastTxHash(txHash ?? null);
         alert('Manual reshuffle successful! You can now start the game.');
       }
